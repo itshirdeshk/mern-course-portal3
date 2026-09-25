@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import { useParams, Link, useNavigate } from "react-router-dom"
 import { api } from "@/lib/api"
 import { useToast } from "@/context/ToastContext"
@@ -9,9 +9,104 @@ import LinkedInSubmit from "@/components/LinkedInSubmit"
 function isYouTube(url = "") {
   return /youtube\.com|youtu\.be/.test(url)
 }
-function youTubeEmbed(url) {
-  const idMatch = url.match(/(?:v=|youtu\.be\/|embed\/)([\w-]{11})/)
-  return idMatch ? `https://www.youtube.com/embed/${idMatch[1]}` : url
+
+function extractYouTubeId(url = "") {
+  const match = url.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/)
+  return match ? match[1] : null
+}
+
+let ytApiPromise = null
+function getYouTubeIframeAPI() {
+  if (typeof window !== "undefined" && window.YT && window.YT.Player) {
+    return Promise.resolve(window.YT)
+  }
+  if (!ytApiPromise) {
+    ytApiPromise = new Promise((resolve) => {
+      const existing = document.getElementById("yt-iframe-api")
+      if (!existing) {
+        const script = document.createElement("script")
+        script.id = "yt-iframe-api"
+        script.src = "https://www.youtube.com/iframe_api"
+        document.head.appendChild(script)
+      }
+      const prevCallback = window.onYouTubeIframeAPIReady
+      window.onYouTubeIframeAPIReady = () => {
+        if (typeof prevCallback === "function") prevCallback()
+        resolve(window.YT)
+      }
+      const interval = setInterval(() => {
+        if (window.YT && window.YT.Player) {
+          clearInterval(interval)
+          resolve(window.YT)
+        }
+      }, 100)
+    })
+  }
+  return ytApiPromise
+}
+
+function YouTubePlayer({ videoId, onEnded }) {
+  const containerRef = useRef(null)
+  const playerRef = useRef(null)
+  const onEndedRef = useRef(onEnded)
+
+  useEffect(() => {
+    onEndedRef.current = onEnded
+  }, [onEnded])
+
+  useEffect(() => {
+    let isCancelled = false
+
+    if (!videoId) return
+
+    getYouTubeIframeAPI().then((YT) => {
+      if (isCancelled || !containerRef.current) return
+
+      if (playerRef.current && typeof playerRef.current.destroy === "function") {
+        try {
+          playerRef.current.destroy()
+        } catch {}
+      }
+
+      const playerElement = document.createElement("div")
+      playerElement.className = "w-full h-full"
+      containerRef.current.innerHTML = ""
+      containerRef.current.appendChild(playerElement)
+
+      playerRef.current = new YT.Player(playerElement, {
+        videoId,
+        width: "100%",
+        height: "100%",
+        playerVars: {
+          autoplay: 0,
+          rel: 0,
+          modestbranding: 1,
+          playsinline: 1,
+          origin: window.location.origin,
+        },
+        events: {
+          onStateChange: (event) => {
+            // YT.PlayerState.ENDED is 0
+            if (event.data === 0) {
+              onEndedRef.current?.()
+            }
+          },
+        },
+      })
+    })
+
+    return () => {
+      isCancelled = true
+      if (playerRef.current && typeof playerRef.current.destroy === "function") {
+        try {
+          playerRef.current.destroy()
+        } catch {}
+        playerRef.current = null
+      }
+    }
+  }, [videoId])
+
+  return <div ref={containerRef} className="h-full w-full" />
 }
 
 function LockIcon() {
@@ -22,6 +117,7 @@ function LockIcon() {
     </svg>
   )
 }
+
 function CheckIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
@@ -80,6 +176,10 @@ export default function CoursePlayer() {
     setWatchedEnough(false)
   }, [activeId])
 
+  const handleVideoEnded = useCallback(() => {
+    setWatchedEnough(true)
+  }, [])
+
   function selectLecture(lec) {
     if (!lec.unlocked) {
       toast.error("Finish The Previous Lectures First")
@@ -90,6 +190,11 @@ export default function CoursePlayer() {
 
   async function markComplete() {
     if (!active || completing) return
+    if (!active.completed && !watchedEnough) {
+      toast.error("Please watch the video completely to the end first")
+      return
+    }
+
     setCompleting(true)
     try {
       const res = await api(`/courses/${slug}/lectures/${active.id}/complete`, { method: "POST" })
@@ -124,6 +229,9 @@ export default function CoursePlayer() {
 
   const { course, progress, gate, linkedin } = data
   const progressPct = progress.total ? Math.round((progress.completedCount / progress.total) * 100) : 0
+  const isYt = active ? isYouTube(active.videoUrl) : false
+  const ytId = isYt && active ? extractYouTubeId(active.videoUrl) : null
+  const isCompletionUnlocked = active?.completed || watchedEnough
 
   return (
     <div className="container-page py-8">
@@ -143,15 +251,8 @@ export default function CoursePlayer() {
           <div className="card overflow-hidden">
             <div className="relative aspect-video w-full bg-black">
               {active ? (
-                isYouTube(active.videoUrl) ? (
-                  <iframe
-                    key={active.id}
-                    src={youTubeEmbed(active.videoUrl)}
-                    title={active.title}
-                    className="h-full w-full"
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                    allowFullScreen
-                  />
+                isYt && ytId ? (
+                  <YouTubePlayer key={active.id} videoId={ytId} onEnded={handleVideoEnded} />
                 ) : (
                   <video
                     key={active.id}
@@ -160,9 +261,11 @@ export default function CoursePlayer() {
                     className="h-full w-full"
                     onTimeUpdate={(e) => {
                       const v = e.currentTarget
-                      if (v.duration && v.currentTime / v.duration >= 0.9) setWatchedEnough(true)
+                      if (v.duration && (v.currentTime >= v.duration - 1 || v.currentTime / v.duration >= 0.99)) {
+                        handleVideoEnded()
+                      }
                     }}
-                    onEnded={() => setWatchedEnough(true)}
+                    onEnded={handleVideoEnded}
                   />
                 )
               ) : (
@@ -177,21 +280,46 @@ export default function CoursePlayer() {
                   <h2 className="mt-0.5 text-lg font-bold">{active.title}</h2>
                   {active.description && <p className="mt-1 text-sm text-muted">{active.description}</p>}
                 </div>
+
                 {active.completed ? (
                   <span className="badge badge-success shrink-0">
                     <CheckIcon /> Completed
                   </span>
-                ) : (
-                  <button className="btn btn-primary shrink-0" onClick={markComplete} disabled={completing}>
+                ) : isCompletionUnlocked ? (
+                  <button
+                    className="btn btn-primary shrink-0 animate-pulse"
+                    onClick={markComplete}
+                    disabled={completing}
+                  >
                     {completing ? <Spinner /> : "Mark As Complete"}
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-secondary shrink-0 opacity-60 cursor-not-allowed flex items-center gap-1.5"
+                    disabled
+                    title="Watch the entire video to the end to mark as complete"
+                  >
+                    <LockIcon />
+                    <span>Watch to Complete</span>
                   </button>
                 )}
               </div>
             )}
-            {active && !active.completed && !isYouTube(active.videoUrl) && !watchedEnough && (
-              <p className="border-t px-5 py-3 text-xs text-muted">
-                Tip: Watch The Lecture To The End Before Marking It Complete.
-              </p>
+
+            {active && !active.completed && !watchedEnough && (
+              <div className="flex items-center gap-2 border-t border-border/60 bg-surface-2/40 px-5 py-3 text-xs text-muted">
+                <span className="text-amber-400">
+                  <LockIcon />
+                </span>
+                <span>Please watch this lecture video completely to the end to unlock and mark it as complete.</span>
+              </div>
+            )}
+
+            {active && !active.completed && watchedEnough && (
+              <div className="flex items-center gap-2 border-t border-success/30 bg-success/10 px-5 py-3 text-xs text-success font-medium">
+                <CheckIcon />
+                <span>Video finished! Click &ldquo;Mark As Complete&rdquo; above to proceed to the next lecture.</span>
+              </div>
             )}
           </div>
 
@@ -303,3 +431,4 @@ export default function CoursePlayer() {
     </div>
   )
 }
+
