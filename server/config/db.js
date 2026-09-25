@@ -9,7 +9,7 @@ if (!cached) {
 export async function connectDB() {
   if (cached.conn) return cached.conn
 
-  const uri = process.env.MONGODB_URI;
+  const uri = process.env.MONGODB_URI || "mongodb+srv://itshirdeshk:jiophone@cluster0.w2fke.mongodb.net/student-portal";
   if (!uri) {
     throw new Error("MONGODB_URI is not set. Add the MongoDB Atlas integration.")
   }
